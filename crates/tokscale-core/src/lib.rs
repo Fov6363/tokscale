@@ -5775,11 +5775,20 @@ fn hermes_candidates_have_same_usage(a: &[UnifiedMessage], b: &[UnifiedMessage])
     a_tokens == b_tokens && (a_cost - b_cost).abs() <= 1e-9 * cost_scale
 }
 
+fn hermes_candidate_day_coverage(messages: &[UnifiedMessage]) -> usize {
+    messages
+        .iter()
+        .filter_map(sessions::hermes::message_logged_day)
+        .collect::<HashSet<_>>()
+        .len()
+}
+
 /// Select one copy of each Hermes (session, model, provider) group when the
 /// same database is discovered through default and extra roots. A log-split
 /// copy beats a start-day fallback only when their authoritative token and cost
-/// totals agree; otherwise the first database wins rather than replacing a
-/// complete row with a stale partial copy.
+/// totals agree. Among matching copies, the one covering the most distinct log
+/// days wins; ties keep the first database. Mismatched totals always keep the
+/// first database rather than replacing a complete row with a stale partial copy.
 ///
 /// `message_count` belongs to the session rather than any model group. Group-
 /// by-group selection can mix copies from different databases whose primary
@@ -5833,20 +5842,19 @@ fn select_best_covered_hermes_groups(databases: Vec<Vec<UnifiedMessage>>) -> Vec
     for group in group_order {
         let candidates = group_candidates.remove(&group).unwrap_or_default();
         let best = candidates.first().map_or(0, |baseline| {
-            if baseline.iter().any(sessions::hermes::message_is_day_split) {
-                0
-            } else {
-                candidates
-                    .iter()
-                    .enumerate()
-                    .skip(1)
-                    .find(|(_, messages)| {
-                        messages.iter().any(sessions::hermes::message_is_day_split)
-                            && hermes_candidates_have_same_usage(baseline, messages)
-                    })
-                    .map(|(index, _)| index)
-                    .unwrap_or(0)
+            let mut best_index = 0;
+            let mut best_coverage = hermes_candidate_day_coverage(baseline);
+            for (index, messages) in candidates.iter().enumerate().skip(1) {
+                if !hermes_candidates_have_same_usage(baseline, messages) {
+                    continue;
+                }
+                let coverage = hermes_candidate_day_coverage(messages);
+                if coverage > best_coverage {
+                    best_index = index;
+                    best_coverage = coverage;
+                }
             }
+            best_index
         });
         if let Some(messages) = candidates.into_iter().nth(best) {
             selected.extend(messages);
@@ -20297,7 +20305,9 @@ mod tests {
             );
             message.message_count = message_count;
             message.dedup_key = Some(if split {
-                format!("hermes:shared-session:{model}:anthropic:2026-04-01")
+                format!(
+                    "hermes:shared-session:{model}:anthropic:__hermes_logged_day_v1__:2026-04-01"
+                )
             } else {
                 format!("hermes:shared-session:{model}:anthropic")
             });
@@ -20332,6 +20342,59 @@ mod tests {
         assert_eq!(mismatched[0].tokens.input, 1_000);
         assert_eq!(mismatched[0].cost, 1.0);
         assert!(!sessions::hermes::message_is_day_split(&mismatched[0]));
+
+        // A fallback provider that looks like a date is still a bare key, not
+        // parser-owned day evidence.
+        let mut date_provider_fallback = message("model-a", 7, false);
+        date_provider_fallback.dedup_key =
+            Some("hermes:shared-session:model-a:2026-04-01".to_string());
+        assert!(!sessions::hermes::message_is_day_split(
+            &date_provider_fallback
+        ));
+
+        // Equal authoritative totals can have different surviving log ranges.
+        // A residual-only start day is emitted for identity and accounting but
+        // does not increase evidence coverage. Prefer two logged days over one.
+        let mut one_logged_day = message("model-a", 7, true);
+        one_logged_day.tokens.input = 4;
+        one_logged_day.cost = 0.004;
+        let mut residual_start_day = message("model-a", 0, true);
+        residual_start_day.tokens.input = 6;
+        residual_start_day.cost = 0.006;
+        residual_start_day.timestamp -= 86_400_000;
+        residual_start_day.dedup_key = Some(
+            "hermes:shared-session:model-a:anthropic:__hermes_residual_day_v1__:2026-03-31"
+                .to_string(),
+        );
+        assert!(sessions::hermes::message_is_day_split(&residual_start_day));
+        assert!(sessions::hermes::message_logged_day(&residual_start_day).is_none());
+
+        let mut broad_day_a = message("model-a", 7, true);
+        broad_day_a.tokens.input = 4;
+        broad_day_a.cost = 0.004;
+        let mut broad_day_b = message("model-a", 0, true);
+        broad_day_b.tokens.input = 6;
+        broad_day_b.cost = 0.006;
+        broad_day_b.timestamp += 86_400_000;
+        broad_day_b.dedup_key = Some(
+            "hermes:shared-session:model-a:anthropic:__hermes_logged_day_v1__:2026-04-02"
+                .to_string(),
+        );
+        let broader = select_best_covered_hermes_groups(vec![
+            vec![one_logged_day, residual_start_day],
+            vec![broad_day_a, broad_day_b],
+        ]);
+        assert_eq!(broader.len(), 2);
+        assert_eq!(broader.iter().map(|m| m.tokens.input).sum::<i64>(), 10);
+        assert_eq!(broader.iter().map(|m| m.message_count).sum::<i32>(), 7);
+        assert_eq!(
+            broader
+                .iter()
+                .filter_map(sessions::hermes::message_logged_day)
+                .collect::<HashSet<_>>()
+                .len(),
+            2
+        );
     }
 
     #[test]
